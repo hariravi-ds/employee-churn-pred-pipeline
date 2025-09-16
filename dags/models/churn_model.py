@@ -1,110 +1,122 @@
-from google.cloud import bigquery, storage
+import os
+import joblib
 import pandas as pd
-from xgboost import XGBClassifier
+from datetime import datetime
+from google.cloud import bigquery, storage
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import LabelEncoder
-import shap, joblib, datetime, os
+from xgboost import XGBClassifier
+import shap
+import logging
 
-# Project config
+# GCP settings
 PROJECT_ID = "robotic-facet-471416-s5"
-DATASET = "my_employee_data"
-MODEL_BUCKET = "my-ml-model-bucket"
-MODEL_FILENAME = "churn_model_latest.pkl"
+BUCKET_NAME = "my-ml-model-bucket"
+MODEL_PATH = "models/churn/"
 
-# 1. TRAIN FUNCTION
-def train_churn_model():
-    client = bigquery.Client(project=PROJECT_ID)
+# BigQuery tables
+TRAIN_TABLE = "my_employee_data.tbl_hr_data"
+TEST_TABLE = "my_employee_data.tl_new_employee"
 
-    # Load training data
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET}.tbl_hr_data`
-    """
-    df = client.query(query).to_dataframe()
+# Initialize clients
+bq_client = bigquery.Client(project=PROJECT_ID)
+storage_client = storage.Client(project=PROJECT_ID)
 
-    # Drop ignored column
-    if "employee_id" in df.columns:
-        df = df.drop(columns=["employee_id"])
 
-    # Separate out the target
-    if "Quit_the_Company" not in df.columns:
-        raise KeyError("❌ Column 'Quit_the_Company' not found in training table")
+def preprocess(df: pd.DataFrame):
+    """Prepare features and target."""
+    df = df.drop(columns=["employee_id"], errors="ignore")
     y = df["Quit_the_Company"]
     X = df.drop(columns=["Quit_the_Company"])
 
-    # Encode categorical columns
     for col in ["salary", "Departments"]:
         if col in X.columns:
             le = LabelEncoder()
-            X[col] = le.fit_transform(X[col].astype(str))
+            X[col] = le.fit_transform(X[col])
+    return X, y
 
-    # Train model
-    model = XGBClassifier(n_estimators=200, max_depth=5, learning_rate=0.1)
-    model.fit(X, y)
 
-    # Explainability (SHAP)
-    explainer = shap.TreeExplainer(model)
-    _ = explainer.shap_values(X.sample(min(200, len(X))))
+def load_data():
+    """Load train and test data from BigQuery."""
+    train_df = bq_client.query(f"SELECT * FROM `{PROJECT_ID}.{TRAIN_TABLE}`").to_dataframe()
+    test_df = bq_client.query(f"SELECT * FROM `{PROJECT_ID}.{TEST_TABLE}`").to_dataframe()
+    return train_df, test_df
+
+
+def save_model(model, accuracy: float):
+    """Save model to GCS with timestamp."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"churn_model_{ts}_{round(accuracy*100,2)}.pkl"
 
     # Save locally
-    model_path = f"/tmp/{MODEL_FILENAME}"
-    joblib.dump(model, model_path)
+    joblib.dump(model, filename)
 
     # Upload to GCS
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(MODEL_BUCKET)
-    blob = bucket.blob(MODEL_FILENAME)
-    blob.upload_from_filename(model_path)
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(f"{MODEL_PATH}{filename}")
+    blob.upload_from_filename(filename)
 
-    print(f"✅ Model trained and saved to gs://{MODEL_BUCKET}/{MODEL_FILENAME}")
+    logging.info(f"Model saved to gs://{BUCKET_NAME}/{MODEL_PATH}{filename}")
+    return filename
 
-# 2. PREDICT FUNCTION
-def predict_churn():
-    client = bigquery.Client(project=PROJECT_ID)
-    storage_client = storage.Client()
 
-    # Download trained model from GCS
-    model_path = f"/tmp/{MODEL_FILENAME}"
-    blob = storage_client.bucket(MODEL_BUCKET).blob(MODEL_FILENAME)
-    blob.download_to_filename(model_path)
-    model = joblib.load(model_path)
+def load_latest_model():
+    """Load the latest model from GCS for comparison."""
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blobs = list(bucket.list_blobs(prefix=MODEL_PATH))
 
-    # Load scoring data
-    query = f"""
-        SELECT *
-        FROM `{PROJECT_ID}.{DATASET}.tl_new_employee`
-    """
-    df = client.query(query).to_dataframe()
+    if not blobs:
+        logging.warning("No previous models found in GCS.")
+        return None
 
-    # Drop ignored + label columns
-    if "employee_id" in df.columns:
-        df = df.drop(columns=["employee_id"])
-    if "Quit_the_Company" in df.columns:
-        df = df.drop(columns=["Quit_the_Company"])
+    # Pick latest by name
+    latest_blob = sorted(blobs, key=lambda b: b.name, reverse=True)[0]
+    latest_blob.download_to_filename("latest_model.pkl")
+    return joblib.load("latest_model.pkl")
 
-    # Encode categorical
-    X = df.copy()
-    for col in ["salary", "Departments"]:
-        if col in X.columns:
-            le = LabelEncoder()
-            X[col] = le.fit_transform(X[col].astype(str))
 
-    # Predict churn probabilities
-    churn_probs = model.predict_proba(X)[:, 1]
+def train_churn_model():
+    """Train new model and compare with previous one."""
+    train_df, test_df = load_data()
 
-    # Create results DataFrame
-    df_predictions = pd.DataFrame({
-        "scoring_date": datetime.date.today(),
-        "churn_probability": churn_probs
-    })
+    X_train, y_train = preprocess(train_df)
+    X_test, y_test = preprocess(test_df)
 
-    if "user_id" in df.columns:
-        df_predictions["user_id"] = df["user_id"]
+    model = XGBClassifier(eval_metric="logloss", random_state=42)
+    model.fit(X_train, y_train)
 
-    # Write back to BigQuery
-    table_id = f"{PROJECT_ID}.{DATASET}.churn_predictions"
-    client.load_table_from_dataframe(
-        df_predictions, table_id, if_exists="replace"
-    ).result()
+    y_pred = model.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+    logging.info(f"New model accuracy: {acc:.4f}")
 
-    print(f"✅ Predictions written to {table_id}")
+    # Drift check: compare with latest model
+    prev_model = load_latest_model()
+    if prev_model:
+        prev_pred = prev_model.predict(X_test)
+        prev_acc = accuracy_score(y_test, prev_pred)
+        logging.info(f"Previous model accuracy: {prev_acc:.4f}")
 
+        if acc < prev_acc:
+            logging.warning("New model underperforms previous model. Keeping old model.")
+            return
+
+    # Save only if better (or first model)
+    save_model(model, acc)
+
+
+def explain_model():
+    """Generate SHAP feature importance for business users."""
+    train_df, _ = load_data()
+    X_train, y_train = preprocess(train_df)
+
+    model = load_latest_model()
+    if not model:
+        logging.warning("No model available for SHAP explanations.")
+        return
+
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_train)
+
+    shap.summary_plot(shap_values, X_train, show=False)  # disable auto-display
+    logging.info("SHAP feature importance generated.")
