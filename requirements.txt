@@ -1,0 +1,27 @@
+# Orchestration
+apache-airflow>=2.9.0
+
+# Google Cloud
+google-cloud-bigquery
+google-cloud-storage
+pandas-gbq
+
+# Data processing
+pandas
+numpy
+scikit-learn
+
+# Machine learning
+xgboost
+lazypredict
+
+# Explainability
+SHAP
+
+# Visualization
+# For reports
+Looker
+
+# For SHAP/feature importance plots
+matplotlib
+seaborn
